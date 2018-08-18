@@ -1,6 +1,7 @@
 # ZeroNet [![Build Status](https://travis-ci.org/HelloZeroNet/ZeroNet.svg?branch=master)](https://travis-ci.org/HelloZeroNet/ZeroNet) [![Documentation](https://img.shields.io/badge/docs-faq-brightgreen.svg)](https://zeronet.readthedocs.org/en/latest/faq/) [![Help](https://img.shields.io/badge/keep_this_project_alive-donate-yellow.svg)](https://zeronet.readthedocs.org/en/latest/help_zeronet/donate/)
 
 [简体中文](./README-zh-cn.md)
+[Русский](./README-ru.md)
 
 Decentralized websites using Bitcoin crypto and the BitTorrent network - https://zeronet.io
 
@@ -66,8 +67,8 @@ Decentralized websites using Bitcoin crypto and the BitTorrent network - https:/
 * Download ZeroBundle package:
   * [Microsoft Windows](https://github.com/HelloZeroNet/ZeroNet-win/archive/dist/ZeroNet-win.zip)
   * [Apple macOS](https://github.com/HelloZeroNet/ZeroNet-mac/archive/dist/ZeroNet-mac.zip)
-  * [Linux 64bit](https://github.com/HelloZeroNet/ZeroBundle/raw/master/dist/ZeroBundle-linux64.tar.gz)
-  * [Linux 32bit](https://github.com/HelloZeroNet/ZeroBundle/raw/master/dist/ZeroBundle-linux32.tar.gz)
+  * [Linux 64-bit](https://github.com/HelloZeroNet/ZeroBundle/raw/master/dist/ZeroBundle-linux64.tar.gz)
+  * [Linux 32-bit](https://github.com/HelloZeroNet/ZeroBundle/raw/master/dist/ZeroBundle-linux32.tar.gz)
 * Unpack anywhere
 * Run `ZeroNet.exe` (win), `ZeroNet(.app)` (osx), `ZeroNet.sh` (linux)
 
@@ -93,7 +94,7 @@ It downloads the latest version of ZeroNet then starts it automatically.
 ### [Arch Linux](https://www.archlinux.org)
 
 * `git clone https://aur.archlinux.org/zeronet.git`
-* `cd zeronet-git`
+* `cd zeronet`
 * `makepkg -srci`
 * `systemctl start zeronet`
 * Open http://127.0.0.1:43110/ in your browser
@@ -129,19 +130,19 @@ See `/usr/share/doc/zeronet-*/README.gentoo.bz2` for further assistance.
 * Open http://127.0.0.1:43110/ in your browser
 
 ### [Docker](https://www.docker.com/)
-* `docker run -d -v <local_data_folder>:/root/data -p 15441:15441 -p 127.0.0.1:43110:43110 nofish/zeronet`
+* `docker run -d -v <local_data_folder>:/root/data -p 26552:26552 -p 127.0.0.1:43110:43110 nofish/zeronet`
 * This Docker image includes the Tor proxy, which is disabled by default. Beware that some
 hosting providers may not allow you running Tor in their servers. If you want to enable it,
 set `ENABLE_TOR` environment variable to `true` (Default: `false`). E.g.:
 
- `docker run -d -e "ENABLE_TOR=true" -v <local_data_folder>:/root/data -p 15441:15441 -p 127.0.0.1:43110:43110 nofish/zeronet`
+ `docker run -d -e "ENABLE_TOR=true" -v <local_data_folder>:/root/data -p 26552:26552 -p 127.0.0.1:43110:43110 nofish/zeronet`
 * Open http://127.0.0.1:43110/ in your browser
 
 ### [Virtualenv](https://virtualenv.readthedocs.org/en/latest/)
 
 * `virtualenv env`
 * `source env/bin/activate`
-* `pip install msgpack-python gevent`
+* `pip install msgpack gevent`
 * `python2 zeronet.py`
 * Open http://127.0.0.1:43110/ in your browser
 
@@ -202,11 +203,10 @@ Site:13DNDk..bhC2 Successfuly published to 3 peers
 
 - Bitcoin: 1QDhxQ6PraUZa21ET5fYUCPgdrwBomnFgX
 - Paypal: https://zeronet.readthedocs.org/en/latest/help_zeronet/donate/
-- Gratipay: https://gratipay.com/zeronet/
 
 ### Sponsors
 
-* Better OSX/Safari compatibility made possible by [BrowserStack.com](https://www.browserstack.com)
+* Better macOS/Safari compatibility made possible by [BrowserStack.com](https://www.browserstack.com)
 
 #### Thank you!
 

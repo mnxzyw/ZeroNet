@@ -1,10 +1,10 @@
 import json
 import time
 import sys
-import hashlib
 import os
 import shutil
 import re
+import copy
 
 import gevent
 
@@ -15,10 +15,17 @@ from util import QueryJson, RateLimit
 from Plugin import PluginManager
 from Translate import translate as _
 from util import helper
+from Content.ContentManager import VerifyError, SignError
 
 
 @PluginManager.acceptPlugins
 class UiWebsocket(object):
+    admin_commands = set([
+        "sitePause", "siteResume", "siteDelete", "siteList", "siteSetLimit", "siteAdd",
+        "channelJoinAllsite", "serverUpdate", "serverPortcheck", "serverShutdown", "serverShowdirectory", "serverGetWrapperNonce",
+        "certSet", "configSet", "permissionAdd", "permissionRemove", "announcerStats"
+    ])
+    async_commands = set(["fileGet", "fileList", "dirList", "fileNeed"])
 
     def __init__(self, ws, site, server, user, request):
         self.ws = ws
@@ -31,14 +38,8 @@ class UiWebsocket(object):
         self.next_message_id = 1
         self.waiting_cb = {}  # Waiting for callback. Key: message_id, Value: function pointer
         self.channels = []  # Channels joined to
-        self.sending = False  # Currently sending to client
+        self.state = {"sending": False}  # Shared state of websocket connection
         self.send_queue = []  # Messages to send to client
-        self.admin_commands = (
-            "sitePause", "siteResume", "siteDelete", "siteList", "siteSetLimit",
-            "channelJoinAllsite", "serverUpdate", "serverPortcheck", "serverShutdown", "serverShowdirectory",
-            "certSet", "configSet", "permissionAdd", "permissionRemove"
-        )
-        self.async_commands = ("fileGet", "fileList", "dirList", "fileNeed")
 
     # Start listener loop
     def start(self):
@@ -76,7 +77,8 @@ class UiWebsocket(object):
 
             if message:
                 try:
-                    self.handleRequest(message)
+                    req = json.loads(message)
+                    self.handleRequest(req)
                 except Exception, err:
                     if config.debug:  # Allow websocket errors to appear on /Debug
                         sys.modules["main"].DebugHook.handleError()
@@ -95,8 +97,8 @@ class UiWebsocket(object):
             if ("0.0.0.0" == bind_ip or "*" == bind_ip) and (not whitelist):
                 self.site.notifications.append([
                     "error",
-                    _(u"You are not going to set up a public gateway. However, <b>your Web UI is<br>" + \
-                        "open to the whole Internet.</b> " + \
+                    _(u"You are not going to set up a public gateway. However, <b>your Web UI is<br>" +
+                        "open to the whole Internet.</b> " +
                         "Please check your configuration.")
                 ])
 
@@ -157,24 +159,34 @@ class UiWebsocket(object):
             return True
 
     # Has permission to access a site
-    def hasSitePermission(self, address):
+    def hasSitePermission(self, address, cmd=None):
         if address != self.site.address and "ADMIN" not in self.site.settings["permissions"]:
             return False
         else:
             return True
 
+    def hasFilePermission(self, inner_path):
+        valid_signers = self.site.content_manager.getValidSigners(inner_path)
+        return self.site.settings["own"] or self.user.getAuthAddress(self.site.address) in valid_signers
+
     # Event in a channel
     def event(self, channel, *params):
         if channel in self.channels:  # We are joined to channel
             if channel == "siteChanged":
-                site = params[0]  # Triggerer site
-                site_info = self.formatSiteInfo(site)
+                site = params[0]
+                site_info = self.formatSiteInfo(site, create_user=False)
                 if len(params) > 1 and params[1]:  # Extra data
                     site_info.update(params[1])
                 self.cmd("setSiteInfo", site_info)
             elif channel == "serverChanged":
                 server_info = self.formatServerInfo()
                 self.cmd("setServerInfo", server_info)
+            elif channel == "announcerChanged":
+                site = params[0]
+                announcer_info = self.formatAnnouncerInfo(site)
+                if len(params) > 1 and params[1]:  # Extra data
+                    announcer_info.update(params[1])
+                self.cmd("setAnnouncerInfo", announcer_info)
 
     # Send response to client (to = message.id)
     def response(self, to, result):
@@ -191,16 +203,17 @@ class UiWebsocket(object):
         if cb:  # Callback after client responded
             self.waiting_cb[message["id"]] = cb
         self.send_queue.append(message)
-        if self.sending:
+        if self.state["sending"]:
             return  # Already sending
         try:
             while self.send_queue:
-                self.sending = True
+                self.state["sending"] = True
                 message = self.send_queue.pop(0)
                 self.ws.send(json.dumps(message))
-                self.sending = False
+                self.state["sending"] = False
         except Exception, err:
             self.log.debug("Websocket send error: %s" % Debug.formatException(err))
+            self.state["sending"] = False
 
     def getPermissions(self, req_id):
         permissions = self.site.settings["permissions"]
@@ -226,8 +239,7 @@ class UiWebsocket(object):
         return wrapper
 
     # Handle incoming messages
-    def handleRequest(self, data):
-        req = json.loads(data)
+    def handleRequest(self, req):
 
         cmd = req.get("cmd")
         params = req.get("params")
@@ -310,6 +322,8 @@ class UiWebsocket(object):
             "fileserver_port": config.fileserver_port,
             "tor_enabled": sys.modules["main"].file_server.tor_manager.enabled,
             "tor_status": sys.modules["main"].file_server.tor_manager.status,
+            "tor_has_meek_bridges": sys.modules["main"].file_server.tor_manager.has_meek_bridges,
+            "tor_use_bridges": config.tor_use_bridges,
             "ui_ip": config.ui_ip,
             "ui_port": config.ui_port,
             "version": config.version,
@@ -319,7 +333,20 @@ class UiWebsocket(object):
             "plugins": PluginManager.plugin_manager.plugin_names
         }
 
+    def formatAnnouncerInfo(self, site):
+        return {"address": site.address, "stats": site.announcer.stats}
+
     # - Actions -
+
+    def actionAs(self, to, address, cmd, params=[]):
+        if not self.hasSitePermission(address, cmd=cmd):
+            return self.response(to, "No permission for site %s" % address)
+        req_self = copy.copy(self)
+        req_self.site = self.server.sites.get(address)
+        req_self.hasCmdPermission = self.hasCmdPermission  # Use the same permissions as current site
+        req_obj = super(UiWebsocket, req_self)
+        req = {"id": to, "cmd": cmd, "params": params}
+        req_obj.handleRequest(req)
 
     # Do callback on response {"cmd": "response", "to": message_id, "result": result}
     def actionResponse(self, to, result):
@@ -351,8 +378,32 @@ class UiWebsocket(object):
 
     # Server variables
     def actionServerInfo(self, to):
-        ret = self.formatServerInfo()
-        self.response(to, ret)
+        back = self.formatServerInfo()
+        self.response(to, back)
+
+    # Create a new wrapper nonce that allows to load html file
+    def actionServerGetWrapperNonce(self, to):
+        wrapper_nonce = self.request.getWrapperNonce()
+        self.response(to, wrapper_nonce)
+
+    def actionAnnouncerInfo(self, to):
+        back = self.formatAnnouncerInfo(self.site)
+        self.response(to, back)
+
+    def actionAnnouncerStats(self, to):
+        back = {}
+        for site in self.server.sites.values():
+            for tracker, stats in site.announcer.stats.iteritems():
+                if tracker not in back:
+                    back[tracker] = {}
+                is_latest_data = stats["time_request"] > back[tracker].get("time_request", 0)
+                for key, val in stats.iteritems():
+                    if key.startswith("num_"):
+                        back[tracker][key] = back[tracker].get(key, 0) + val
+                    elif is_latest_data:
+                        back[tracker][key] = val
+
+        return back
 
     # Sign content.json
     def actionSiteSign(self, to, privatekey=None, inner_path="content.json", remove_missing_optional=False, update_changed_files=False, response_ok=True):
@@ -374,10 +425,7 @@ class UiWebsocket(object):
             extend["cert_user_id"] = self.user.getCertUserId(site.address)
             extend["cert_sign"] = cert["cert_sign"]
 
-        if (
-            not site.settings["own"] and
-            self.user.getAuthAddress(self.site.address) not in self.site.content_manager.getValidSigners(inner_path)
-        ):
+        if not self.hasFilePermission(inner_path):
             self.log.error("SiteSign error: you don't own this site & site owner doesn't allow you to do so.")
             return self.response(to, {"error": "Forbidden, you can only modify your own sites"})
 
@@ -391,11 +439,16 @@ class UiWebsocket(object):
         site.content_manager.loadContent(inner_path, add_bad_files=False, force=True)
         # Sign using private key sent by user
         try:
-            signed = site.content_manager.sign(inner_path, privatekey, extend=extend, update_changed_files=update_changed_files, remove_missing_optional=remove_missing_optional)
-        except Exception, err:
+            site.content_manager.sign(inner_path, privatekey, extend=extend, update_changed_files=update_changed_files, remove_missing_optional=remove_missing_optional)
+        except (VerifyError, SignError) as err:
             self.cmd("notification", ["error", _["Content signing failed"] + "<br><small>%s</small>" % err])
             self.response(to, {"error": "Site sign failed: %s" % err})
             self.log.error("Site sign failed: %s: %s" % (inner_path, Debug.formatException(err)))
+            return
+        except Exception as err:
+            self.cmd("notification", ["error", _["Content signing error"] + "<br><small>%s</small>" % Debug.formatException(err)])
+            self.response(to, {"error": "Site sign error: %s" % Debug.formatException(err)})
+            self.log.error("Site sign error: %s: %s" % (inner_path, Debug.formatException(err)))
             return
 
         site.content_manager.loadContent(inner_path, add_bad_files=False)  # Load new content.json, ignore errors
@@ -409,9 +462,12 @@ class UiWebsocket(object):
             return inner_path
 
     # Sign and publish content.json
-    def actionSitePublish(self, to, privatekey=None, inner_path="content.json", sign=True):
+    def actionSitePublish(self, to, privatekey=None, inner_path="content.json", sign=True, remove_missing_optional=False, update_changed_files=False):
         if sign:
-            inner_path = self.actionSiteSign(to, privatekey, inner_path, response_ok=False)
+            inner_path = self.actionSiteSign(
+                to, privatekey, inner_path, response_ok=False,
+                remove_missing_optional=remove_missing_optional, update_changed_files=update_changed_files
+            )
             if not inner_path:
                 return
         # Publishing
@@ -420,7 +476,7 @@ class UiWebsocket(object):
             self.site.saveSettings()
             self.site.announce()
 
-        if not inner_path in self.site.content_manager.contents:
+        if inner_path not in self.site.content_manager.contents:
             return self.response(to, {"error": "File %s not found" % inner_path})
 
         event_name = "publish %s %s" % (self.site.address, inner_path)
@@ -487,11 +543,17 @@ class UiWebsocket(object):
                 if notification:
                     self.response(to, {"error": "Content publish failed."})
 
+    def actionSiteReload(self, to, inner_path):
+        self.site.content_manager.loadContent(inner_path, add_bad_files=False)
+        self.site.storage.verifyFiles(quick_check=True)
+        self.site.updateWebsocket()
+        return "ok"
+
     # Write a file to disk
     def actionFileWrite(self, to, inner_path, content_base64, ignore_bad_files=False):
         valid_signers = self.site.content_manager.getValidSigners(inner_path)
         auth_address = self.user.getAuthAddress(self.site.address)
-        if not self.site.settings["own"] and auth_address not in valid_signers:
+        if not self.hasFilePermission(inner_path):
             self.log.error("FileWrite forbidden %s not in valid_signers %s" % (auth_address, valid_signers))
             return self.response(to, {"error": "Forbidden, you can only modify your own files"})
 
@@ -539,15 +601,14 @@ class UiWebsocket(object):
                 ws.event("siteChanged", self.site, {"event": ["file_done", inner_path]})
 
     def actionFileDelete(self, to, inner_path):
-        if (
-            not self.site.settings["own"] and
-            self.user.getAuthAddress(self.site.address) not in self.site.content_manager.getValidSigners(inner_path)
-        ):
+        if not self.hasFilePermission(inner_path):
             self.log.error("File delete error: you don't own this site & you are not approved by the owner.")
             return self.response(to, {"error": "Forbidden, you can only modify your own files"})
 
+        need_delete = True
         file_info = self.site.content_manager.getFileInfo(inner_path)
         if file_info and file_info.get("optional"):
+            # Non-existing optional files won't be removed from content.json, so we have to do it manually
             self.log.debug("Deleting optional file: %s" % inner_path)
             relative_path = file_info["relative_path"]
             content_json = self.site.storage.loadJson(file_info["content_inner_path"])
@@ -555,12 +616,14 @@ class UiWebsocket(object):
                 del content_json["files_optional"][relative_path]
                 self.site.storage.writeJson(file_info["content_inner_path"], content_json)
                 self.site.content_manager.loadContent(file_info["content_inner_path"], add_bad_files=False, force=True)
+                need_delete = self.site.storage.isFile(inner_path)  # File sill exists after removing from content.json (owned site)
 
-        try:
-            self.site.storage.delete(inner_path)
-        except Exception, err:
-            self.log.error("File delete error: Exception - %s" % err)
-            return self.response(to, {"error": "Delete error: %s" % err})
+        if need_delete:
+            try:
+                self.site.storage.delete(inner_path)
+            except Exception, err:
+                self.log.error("File delete error: %s" % err)
+                return self.response(to, {"error": "Delete error: %s" % err})
 
         self.response(to, "ok")
 
@@ -579,11 +642,17 @@ class UiWebsocket(object):
 
     # List files in directory
     def actionFileList(self, to, inner_path):
-        return self.response(to, list(self.site.storage.walk(inner_path)))
+        try:
+            return list(self.site.storage.walk(inner_path))
+        except Exception as err:
+            return {"error": str(err)}
 
     # List directories in a directory
     def actionDirList(self, to, inner_path):
-        return self.response(to, list(self.site.storage.list(inner_path)))
+        try:
+            return list(self.site.storage.list(inner_path))
+        except Exception as err:
+            return {"error": str(err)}
 
     # Sql query
     def actionDbQuery(self, to, query, params=None, wait_for=None):
@@ -627,12 +696,23 @@ class UiWebsocket(object):
             return self.response(to, {"error": str(err)})
         return self.response(to, "ok")
 
-    def actionFileRules(self, to, inner_path):
-        rules = self.site.content_manager.getRules(inner_path)
-        if inner_path.endswith("content.json") and rules:
+    def actionFileRules(self, to, inner_path, use_my_cert=False, content=None):
+        if not content:  # No content defined by function call
             content = self.site.content_manager.contents.get(inner_path)
+
+        if not content:  # File not created yet
+            cert = self.user.getCert(self.site.address)
+            if cert and cert["auth_address"] in self.site.content_manager.getValidSigners(inner_path):
+                # Current selected cert if valid for this site, add it to query rules
+                content = {}
+                content["cert_auth_type"] = cert["auth_type"]
+                content["cert_user_id"] = self.user.getCertUserId(self.site.address)
+                content["cert_sign"] = cert["cert_sign"]
+
+        rules = self.site.content_manager.getRules(inner_path, content)
+        if inner_path.endswith("content.json") and rules:
             if content:
-                rules["current_size"] = len(json.dumps(content)) + sum([file["size"] for file in content["files"].values()])
+                rules["current_size"] = len(json.dumps(content)) + sum([file["size"] for file in content.get("files", {}).values()])
             else:
                 rules["current_size"] = 0
         return self.response(to, rules)
@@ -678,7 +758,7 @@ class UiWebsocket(object):
     # Select certificate for site
     def actionCertSelect(self, to, accepted_domains=[], accept_any=False):
         accounts = []
-        accounts.append(["", _["Unique to site"], ""])  # Default option
+        accounts.append(["", _["No certificate"], ""])  # Default option
         active = ""  # Make it active if no other option found
 
         # Add my certs
@@ -710,7 +790,7 @@ class UiWebsocket(object):
             body += "<div style='background-color: #F7F7F7; margin-right: -30px'>"
             for domain in more_domains:
                 body += _(u"""
-                 <a href='/{domain}' onclick='wrapper.gotoSite(this)' class='select'>
+                 <a href='/{domain}' onclick='zeroframe.certSelectGotoSite(this)' class='select'>
                   <small style='float: right; margin-right: 40px; margin-top: -1px'>{_[Register]} &raquo;</small>{domain}
                  </a>
                 """)
@@ -720,16 +800,14 @@ class UiWebsocket(object):
             <script>
              $(".notification .select.cert").on("click", function() {
                 $(".notification .select").removeClass('active')
-                wrapper.ws.cmd('certSet', [this.title], function() {
-                    wrapper.sendInner({"cmd": "response", "to": %s, "result": this.title})
-                })
+                zeroframe.response(%s, this.title)
                 return false
              })
             </script>
-        """ % to
+        """ % self.next_message_id
 
         # Send the notification
-        self.cmd("notification", ["ask", body])
+        self.cmd("notification", ["ask", body], lambda domain: self.actionCertSet(to, domain))
 
     # - Admin actions -
 
@@ -748,6 +826,8 @@ class UiWebsocket(object):
 
     def actionPermissionDetails(self, to, permission):
         if permission == "ADMIN":
+            self.response(to, _["Modify your client's configuration and access all site"] + " <span style='color: red'>" + _["(Dangerous!)"] + "</span>")
+        elif permission == "NOSANDBOX":
             self.response(to, _["Modify your client's configuration and access all site"] + " <span style='color: red'>" + _["(Dangerous!)"] + "</span>")
         else:
             self.response(to, "")
@@ -778,9 +858,9 @@ class UiWebsocket(object):
                 site.websockets.append(self)
 
     # Update site content.json
-    def actionSiteUpdate(self, to, address, check_files=False, since=None):
+    def actionSiteUpdate(self, to, address, check_files=False, since=None, announce=False):
         def updateThread():
-            site.update(check_files=check_files, since=since)
+            site.update(announce=announce, check_files=check_files, since=since)
             self.response(to, "Updated")
 
         site = self.server.sites.get(address)
@@ -868,7 +948,18 @@ class UiWebsocket(object):
         self.site.settings["size_limit"] = int(size_limit)
         self.site.saveSettings()
         self.response(to, "ok")
+        self.site.updateWebsocket()
         self.site.download(blind_includes=True)
+
+    def actionSiteAdd(self, to, address):
+        site_manager = SiteManager.site_manager
+        if address in site_manager.sites:
+            return {"error": "Site already added"}
+        else:
+            if site_manager.need(address):
+                return "ok"
+            else:
+                return {"error": "Invalid address"}
 
     def actionUserGetSettings(self, to):
         settings = self.user.sites[self.site.address].get("settings", {})
@@ -890,7 +981,9 @@ class UiWebsocket(object):
         res = sys.modules["main"].file_server.openport()
         self.response(to, res)
 
-    def actionServerShutdown(self, to):
+    def actionServerShutdown(self, to, restart=False):
+        if restart:
+            sys.modules["main"].restart_after_shutdown = True
         sys.modules["main"].file_server.stop()
         sys.modules["main"].ui_server.stop()
 
@@ -914,20 +1007,40 @@ class UiWebsocket(object):
             return self.response(to, {"error": "Not a directory"})
 
     def actionConfigSet(self, to, key, value):
-        if key not in ["tor", "language"]:
-            self.response(to, {"error": "Forbidden"})
+        if key not in config.keys_api_change_allowed:
+            self.response(to, {"error": "Forbidden you cannot set this config key"})
             return
 
         config.saveValue(key, value)
+
+        if key not in config.keys_restart_need:
+            if value is None:  # Default value
+                setattr(config, key, config.parser.get_default(key))
+                setattr(config.arguments, key, config.parser.get_default(key))
+            else:
+                setattr(config, key, value)
+                setattr(config.arguments, key, value)
+        else:
+            config.need_restart = True
+            config.pending_changes[key] = value
 
         if key == "language":
             import Translate
             for translate in Translate.translates:
                 translate.setLanguage(value)
-            self.cmd("notification", ["done",
-                _["You have successfully changed the web interface's language!"] + "<br>" +
-                _["Due to the browser's caching, the full transformation could take some minute."]
-            , 10000])
-            config.language = value
+            message = _["You have successfully changed the web interface's language!"] + "<br>"
+            message += _["Due to the browser's caching, the full transformation could take some minute."]
+            self.cmd("notification", ["done", message, 10000])
+
+        if key == "tor_use_bridges":
+            if value is None:
+                value = False
+            else:
+                value = True
+            tor_manager = sys.modules["main"].file_server.tor_manager
+            tor_manager.request("SETCONF UseBridges=%i" % value)
+
+        if key == "trackers_file":
+            config.loadTrackersFile()
 
         self.response(to, "ok")

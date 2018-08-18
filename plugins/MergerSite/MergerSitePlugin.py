@@ -112,8 +112,8 @@ class UiWebsocketPlugin(object):
                 ret[address] = merged_type
         self.response(to, ret)
 
-    def hasSitePermission(self, address):
-        if super(UiWebsocketPlugin, self).hasSitePermission(address):
+    def hasSitePermission(self, address, *args, **kwargs):
+        if super(UiWebsocketPlugin, self).hasSitePermission(address, *args, **kwargs):
             return True
         else:
             if self.site.address in [merger_site.address for merger_site in merged_to_merger.get(address, [])]:
@@ -258,6 +258,7 @@ class SiteStoragePlugin(object):
             for address, merged_type in merged_db.iteritems()
             if merged_type in merger_types
         ]
+        found = 0
         for merged_site in merged_sites:
             self.log.debug("Loading merged site: %s" % merged_site)
             merged_type = merged_db[merged_site.address]
@@ -280,6 +281,9 @@ class SiteStoragePlugin(object):
                         yield merged_inner_path, merged_site.storage.getPath(file_inner_path)
                     else:
                         merged_site.log.error("[MISSING] %s" % file_inner_path)
+                    found += 1
+                    if found % 100 == 0:
+                        time.sleep(0.000001)  # Context switch to avoid UI block
 
     # Also notice merger sites on a merged site file change
     def onUpdated(self, inner_path, file=None):
